@@ -1,0 +1,840 @@
+/*
+#include <config.h>
+*/
+#ifdef linux
+/* For pread()/pwrite() */
+#define _XOPEN_SOURCE 500
+#endif
+
+#define FUSE_USE_VERSION 23
+
+#include <fuse.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/statfs.h>
+#ifdef HAVE_SETXATTR
+#include <sys/xattr.h>
+#endif
+
+#include "cf_file.h"
+#include "cf_map.h"
+#include "cf_compression.h"
+#include "cf_config.h"
+
+#define CF_DEBUG
+
+
+#define FREE(ptr)	free(ptr); fr++
+#define MALLOC(ptr)	malloc(ptr); ma++
+#define REALLOC(ptr,sz)	realloc(ptr,sz); ra++;
+
+/* GLOBALS */
+Cf_config config;
+Cf_map mapping;
+int mapping_count;
+
+int fr = 0;
+int ma = 0;
+int ra = 0;
+
+/* ------------------------------------------------- */
+
+static int cf_getattr(const char *path, struct stat *stbuf)
+{
+    int res;
+    int fd;
+    char xpath[512];
+    Cf_header header;
+
+    cf_path(config, path, xpath);
+
+    res = lstat(xpath, stbuf);
+    if(res == -1)
+        return -errno;
+
+    if (S_ISREG(stbuf->st_mode) && (stbuf->st_size > 0)) {
+        fd = open (xpath, O_RDONLY);
+        header = cf_header_read(config, fd);
+	stbuf->st_size = cf_header_size(header);
+	close(fd);
+    }
+
+    return 0;
+}
+
+
+static int cf_readlink(const char *path, char *buf, size_t size)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = readlink(xpath, buf, size - 1);
+    if(res == -1)
+        return -errno;
+
+    buf[res] = '\0';
+    return 0;
+}
+
+static int cf_opendir(const char *path, struct fuse_file_info *fi)
+{
+    DIR *dp;
+
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    dp = opendir(xpath);
+    if (dp == NULL)
+        return -errno;
+
+    fi->fh = (unsigned long) dp;
+    return 0;
+}
+
+static int cf_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                       off_t offset, struct fuse_file_info *fi)
+{
+    DIR *dp = (DIR *) fi->fh;
+    struct dirent *de;
+
+    (void) path;
+    seekdir(dp, offset);
+    while ((de = readdir(dp)) != NULL) {
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        st.st_ino = de->d_ino;
+        st.st_mode = de->d_type << 12;
+        if (filler(buf, de->d_name, &st, de->d_off))
+            break;
+    }
+
+    return 0;
+}
+
+static int cf_releasedir(const char *path, struct fuse_file_info *fi)
+{
+    DIR *dp = (DIR *) fi->fh;
+    (void) path;
+    closedir(dp);
+    return 0;
+}
+
+static int cf_mknod(const char *path, mode_t mode, dev_t rdev)
+{
+    int res;
+    int fd;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = mknod(xpath, mode, rdev);
+    if(res == -1) 
+        return -errno;
+    else {
+	/* New node: write empty header */
+	fd = open(xpath, O_RDWR);
+	cf_header_write(config, fd, 0);
+	close(fd);
+    }
+
+    return 0;
+}
+
+static int cf_mkdir(const char *path, mode_t mode)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = mkdir(xpath, mode);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_unlink(const char *path)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = unlink(xpath);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_rmdir(const char *path)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = rmdir(xpath);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_symlink(const char *from, const char *to)
+{
+    int res;
+    char xfrom[512];
+    char xto[512];
+
+    strcpy(xfrom, cf_config_get_backendpath(config));
+    if (from[0] != '/')
+	strcat(xfrom, "/");
+
+    strcat(xfrom, from);
+
+    cf_path(config, to, xto);
+
+    res = symlink(from, xto);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_rename(const char *from, const char *to)
+{
+    int res;
+    char xfrom[512];
+    char xto[512];
+
+    cf_path(config, from, xfrom);
+    cf_path(config, to, xto);
+
+    res = rename(xfrom, xto);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_link(const char *from, const char *to)
+{
+    int res;
+    char xfrom[512];
+    char xto[512];
+
+    cf_path(config, from, xfrom);
+    cf_path(config, to, xto);
+
+    res = link(xfrom, xto);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_chmod(const char *path, mode_t mode)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = chmod(xpath, mode);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_chown(const char *path, uid_t uid, gid_t gid)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = lchown(xpath, uid, gid);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_truncate(const char *path, off_t size)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = truncate(xpath, size);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_utime(const char *path, struct utimbuf *buf)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = utime(xpath, buf);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+
+static int cf_open(const char *path, struct fuse_file_info *fi)
+{
+    int res;
+    int pos;
+    char xpath[512];
+    unsigned int flags;
+    Cf_header header;
+    int i_size;
+    char *i_buffer;
+
+    cf_path(config, path, xpath);
+
+    #ifdef CF_DEBUG
+    puts(path);
+    #endif
+
+
+    /* Lock entire mapping */
+    pthread_mutex_lock(&cf_map_get_map_lock(mapping));
+    mapping_count++;
+
+    flags = fi->flags;
+    fi->flags = O_RDWR;
+
+    pos = cf_map_findname(mapping, xpath, res);
+    if (pos == -1) {
+
+	res = open(xpath, fi->flags); /*  */
+    	if(res == -1) {
+		/* Unlock */
+		pthread_mutex_unlock(&cf_map_get_map_lock(mapping));
+        	return -errno;
+	}
+	pos = cf_map_addname(mapping, xpath, res);
+
+	/* Unlock mapping asap (do decompress after this line) */	
+	pthread_mutex_unlock(&cf_map_get_map_lock(mapping));
+
+	/* Lock the data */
+	pthread_mutex_lock(&cf_map_get_datalock(mapping,pos));
+	if (cf_map_get_data(mapping, pos))
+		puts("data not empty!");
+
+	cf_map_set_data(mapping, pos,  NULL);
+	cf_map_set_flags(mapping, pos, flags);
+
+	header = cf_header_read(config, res);
+	cf_map_set_size(mapping, pos, cf_header_size(header));
+
+	/* Some files contain compressed data (ad hoc compress) if so not compression : mp3, jpg, ... */
+	cf_map_set_no_compress(mapping, pos, cf_file_no_compress(config, path));
+
+
+    	i_buffer = cf_map_get_data(mapping, pos);
+    	i_size = cf_map_get_size(mapping, pos);
+
+    	/* Data already in mapping? */
+    	if ((!i_buffer) && i_size && !cf_map_get_no_compress(mapping, pos)) {
+		#ifdef CF_DEBUG
+		printf("READ FROM DISK\n");
+		#endif
+		/* No not present: read from file */
+		i_buffer = (char *) MALLOC(i_size);
+		cf_map_set_data(mapping, pos, i_buffer);
+
+		if (cf_data_read(config, res, i_buffer, i_size))
+			puts("ERROR: cf_data_read problem");
+
+    	}
+
+	#ifdef CF_DEBUG
+	puts("new map entry");
+	#endif
+
+	/* Unlock the data */
+	pthread_mutex_unlock(&cf_map_get_datalock(mapping,pos));
+    } else {
+	/* Could be cached: file already closed -> reopen and install fd */
+	if (cf_map_get_fd(mapping, pos) == -1) {
+		res = open(xpath, fi->flags); /*  */
+	    	if(res == -1) {
+			/* Unlock */
+			pthread_mutex_unlock(&cf_map_get_map_lock(mapping));
+	        	return -errno;
+		}
+
+		#ifdef CF_DEBUG
+		puts("cached");
+		#endif
+		cf_map_set_fd(mapping, pos, res);
+	} else {
+		#ifdef CF_DEBUG
+		puts("buffered");
+		#endif
+	}
+		
+	/* Unlock mapping */	
+	pthread_mutex_unlock(&cf_map_get_map_lock(mapping));
+    }
+
+    /* Lock for read to track number of open() calls */
+    pthread_rwlock_rdlock(&cf_map_get_openlock(mapping,pos));
+
+#ifdef CF_DEBUG
+    printf("threads %d\n",mapping_count);
+#endif
+
+    fi->fh = pos;
+
+    return 0;
+}
+
+static int cf_read(const char *path, char *buf, size_t size, off_t offset,
+                    struct fuse_file_info *fi)
+{
+    int res;
+    int pos;
+    int i_size;
+    char *i_buffer;
+
+    (void) path;
+
+#ifdef CF_DEBUG
+puts(path);
+#endif
+
+    pos = fi->fh;
+    /* Normal read for files not compressed by us */
+    if (cf_map_get_no_compress(mapping, pos)) {
+	res = pread(cf_map_get_fd(mapping, pos), buf, size, sizeof(Cf_header)+offset);
+
+	if (res == -1)
+		res = -errno;
+
+	return res;
+    }
+
+pthread_rwlock_rdlock(&cf_map_get_lock(mapping,pos));
+
+
+    i_buffer = cf_map_get_data(mapping, pos);
+    i_size = cf_map_get_size(mapping, pos);
+
+
+#ifdef CF_DEBUG_L2
+printf("in %d (%f)\n", i_size, (float)offset+(float)size);
+#endif
+
+    if (offset > i_size)
+	printf("ERROR: offset (%d) beyond i_size (%d)\n", (int)offset, i_size);
+
+    /* Adjust size to data present */   
+    if ((offset+size) > i_size)
+	i_size = i_size - offset;
+
+    if ((i_size - offset) >= size)
+	i_size =  size;
+
+#ifdef CF_DEBUG_L2
+printf("copying %d (%f)\n", i_size, (float)offset+(float)size);
+#endif
+    /* Copy to output */
+    memcpy(buf, i_buffer+offset, i_size);
+#ifdef CF_DEBUG_L2
+puts("copied");
+#endif
+
+    res = size;
+
+pthread_rwlock_unlock(&cf_map_get_lock(mapping,pos));
+
+    return res;
+}
+
+static int cf_write(const char *path, const char *buf, size_t size,
+                     off_t offset, struct fuse_file_info *fi)
+{
+    int res;
+    int pos;
+    int i_size;
+    char *i_buffer;
+/*
+    Cf_header header;
+*/
+#ifdef CF_DEBUG
+puts(path);
+#endif
+
+    pos = fi->fh;
+
+
+	if (cf_map_get_flags(mapping, pos) == O_RDONLY)
+		puts("ERROR: writing to a readonly file!");
+
+	/* No to be compressed by us */
+	if (cf_map_get_no_compress(mapping, pos)) {
+		res = pwrite(cf_map_get_fd(mapping, pos), buf, size, sizeof(Cf_header)+offset);
+
+		if (res == -1)
+			res = -errno;
+
+		return res;
+	}
+
+	pthread_rwlock_wrlock(&cf_map_get_lock(mapping,pos));
+
+	/* Lock the data */
+	pthread_mutex_lock(&cf_map_get_datalock(mapping,pos));
+
+	i_buffer = cf_map_get_data(mapping, pos);
+	i_size = cf_map_get_size(mapping, pos);
+
+	if (offset+size > i_size) {
+		i_size = offset+size;
+		i_buffer = (char *) REALLOC(i_buffer, i_size);
+
+		cf_map_set_data(mapping, pos, i_buffer);
+		cf_map_set_size(mapping, pos, i_size);
+	}
+
+	/* copy */
+	memcpy(i_buffer+offset, buf, size);
+
+	cf_map_set_dirty(mapping, pos, 1);
+
+	/* Unlock the data */
+	pthread_mutex_unlock(&cf_map_get_datalock(mapping,pos));
+
+    res = size;
+
+pthread_rwlock_unlock(&cf_map_get_lock(mapping,pos));
+
+    return res;
+}
+
+static int cf_statfs(const char *path, struct statfs *stbuf)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = statfs(xpath, stbuf);
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int cf_release(const char *path, struct fuse_file_info *fi)
+{
+    int res;
+    int pos;
+    int i_size;
+    int fd;
+    int nocompress;
+    int dirty;
+    char *i_buffer;
+
+#ifdef CF_DEBUG
+puts(path);
+#endif
+
+    pos = fi->fh;
+
+
+    /* Unlock: decrease number of readlocks = nr of open() calls */	
+    pthread_rwlock_unlock(&cf_map_get_openlock(mapping,pos));
+
+
+    /* If no more thread with rdlock the wrlock means we can close */
+    if (pthread_rwlock_trywrlock(&cf_map_get_openlock(mapping, pos))) {
+	#ifdef CF_DEBUG
+	printf("not releasing %s, still threads %d\n", path, mapping_count);
+	#endif
+
+	return 0;
+    }
+
+
+	fd = cf_map_get_fd(mapping, pos);
+	nocompress = cf_map_get_no_compress(mapping, pos);
+	i_buffer = cf_map_get_data(mapping, pos);
+	i_size = cf_map_get_size(mapping, pos);
+	dirty = cf_map_get_dirty(mapping, pos);
+
+
+	if (nocompress) {
+		cf_header_write(config, fd, file_size(fd)-sizeof(Cf_header));
+	} else {
+		/* Compress ONLY if data changed */
+		if ( dirty )  {
+			cf_header_write(config, fd, i_size);
+			res = cf_data_write(config, fd, i_buffer, i_size, nocompress);
+
+			#ifdef CF_DEBUG_L2
+			printf("Release: %d to %d (handle = %d)\n", i_size, res, pos);
+			#endif
+		}
+	}
+
+	pthread_mutex_lock(&cf_map_get_map_lock(mapping));
+	/* Protect file close */
+	close(fd);
+	cf_map_del(mapping, pos);
+	pthread_mutex_unlock(&cf_map_get_map_lock(mapping));
+
+
+	#ifdef CF_DEBUG
+	printf("copying %d (%f)\n", i_size, (float)offset+(float)size);
+	#endif
+
+	/* unlock this entry */
+	pthread_rwlock_unlock(&cf_map_get_openlock(mapping,pos));
+
+	if(res == -1)
+		return -errno;
+
+    return 0;
+}
+
+static int cf_fsync(const char *path, int isdatasync,
+                     struct fuse_file_info *fi)
+{
+    int res;
+    int pos;
+    (void) path;
+
+    pos = fi->fh;
+
+    if (isdatasync)
+        res = fdatasync(cf_map_get_fd(mapping, pos));
+    else
+        res = fsync(cf_map_get_fd(mapping, pos));
+    if(res == -1)
+        return -errno;
+
+    return 0;
+}
+
+#ifdef HAVE_SETXATTR
+/* xattr operations are optional and can safely be left unimplemented */
+static int cf_setxattr(const char *path, const char *name, const char *value,
+                        size_t size, int flags)
+{
+    int res;
+
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = lsetxattr(xpath, name, value, size, flags);
+    if(res == -1)
+        return -errno;
+    return 0;
+}
+
+static int cf_getxattr(const char *path, const char *name, char *value,
+                    size_t size)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = lgetxattr(path, name, value, size);
+    if(res == -1)
+        return -errno;
+    return res;
+}
+
+static int cf_listxattr(const char *path, char *list, size_t size)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = llistxattr(path, list, size);
+    if(res == -1)
+        return -errno;
+    return res;
+}
+
+static int cf_removexattr(const char *path, const char *name)
+{
+    int res;
+    char xpath[512];
+
+    cf_path(config, path, xpath);
+
+    res = lremovexattr(path, name);
+    if(res == -1)
+        return -errno;
+    return 0;
+}
+#endif /* HAVE_SETXATTR */
+
+
+void* cf_scrubber(void *ptr) {
+	while (1) {
+		sleep(10);
+
+puts("scrub");
+#ifdef CF_DEBUG
+#endif
+		if (!pthread_mutex_trylock(&cf_map_get_map_lock(mapping))) {
+			cf_map_scrub(mapping, config);
+			pthread_mutex_unlock(&cf_map_get_map_lock(mapping));
+		}
+	}
+}
+
+
+static void* cf_init(void)
+{
+	/*
+		All this is useless crap right now, I save nothing usefull.
+	*/
+	pthread_t scrubber;
+	int fd;
+	char xpath[512];
+	int *cf_fs_size;
+
+	/* A little ego tripping... */
+	printf("---------------------------------------------------------------------\n");
+	printf("compFUSEd version %d.%d by Johan Parent  (johan@info.vub.ac.be)\n", CF_VERSION_MAJ, CF_VERSION_MIN);
+	printf("\n");
+	printf("\t - This version can run in multi-threaded mode!\n");
+	printf("\t - You run this program at your own risk, do not store valuable data on this FS\n");
+	printf("\t - NEVER modify anything in the backend directory while the compFUSEd FS is mounted\n");
+	printf("\n");
+	printf("Feedback at above mentioned address\n");
+	printf("---------------------------------------------------------------------\n");
+	printf("\n");
+
+	cf_path(config, "/.cf_fs_info.bin", xpath);
+	cf_fs_size = (int *) malloc(sizeof(int));
+
+	fd = open(xpath, O_RDWR);
+	if (fd == -1) {
+		puts("Can not read fs info");
+	} else {
+		pread(fd, cf_fs_size, sizeof(int), 0);
+		close(fd);
+	}
+
+	/* Lock for mapping global var */
+	pthread_mutex_init(&cf_map_get_map_lock(mapping), NULL);
+
+	mapping_count = 0;
+
+	pthread_create(&scrubber, NULL, cf_scrubber, config);
+
+	return cf_fs_size;
+}
+
+static void cf_destroy(void *ptr)
+{
+	/*
+		All this is useless crap right now, I save nothing usefull.
+	*/
+	int fd;
+	char xpath[512];
+	int *cf_fs_size;
+
+	cf_path(config, "/.cf_fs_info.bin", xpath);
+
+	cf_fs_size = (int *) ptr;
+
+	fd = open(xpath, O_RDWR);
+	if (fd == -1) 
+		puts("Can not read fs info");
+	else {
+		pwrite(fd, cf_fs_size, sizeof(int), 0);
+		close(fd);
+	}
+
+	printf("fr %d ma %d ra %d\n", fr, ma, ra);
+
+	free(ptr);
+}
+
+static struct fuse_operations cf_oper = {
+    .getattr	= cf_getattr,
+    .readlink	= cf_readlink,
+    .opendir	= cf_opendir,
+    .readdir	= cf_readdir,
+    .releasedir	= cf_releasedir,
+    .mknod	= cf_mknod,
+    .mkdir	= cf_mkdir,
+    .symlink	= cf_symlink,
+    .unlink	= cf_unlink,
+    .rmdir	= cf_rmdir,
+    .rename	= cf_rename,
+    .link	= cf_link,
+    .chmod	= cf_chmod,
+    .chown	= cf_chown,
+    .truncate	= cf_truncate,
+    .utime	= cf_utime,
+    .open	= cf_open,
+    .read	= cf_read,
+    .write	= cf_write,
+    .statfs	= cf_statfs,
+    .release	= cf_release,
+    .fsync	= cf_fsync,
+    .init	= cf_init,
+    .destroy	= cf_destroy,
+#ifdef HAVE_SETXATTR
+    .setxattr	= cf_setxattr,
+    .getxattr	= cf_getxattr,
+    .listxattr	= cf_listxattr,
+    .removexattr= cf_removexattr,
+#endif
+};
+
+
+int main(int argc, char *argv[])
+{
+	char config_file[128];
+
+	/* Read config file */
+	strcpy(config_file, argv[0]);
+	strcat(config_file, ".conf");
+
+	config = cf_config_alloc();
+	cf_config_init(config);
+	cf_config_read(config, config_file);
+
+        /* Init defaults */
+	mapping = cf_map_alloc();
+	cf_map_init(mapping, config);
+
+
+
+
+    return fuse_main(argc, argv, &cf_oper);
+}

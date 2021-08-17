@@ -1,0 +1,96 @@
+compFUSEd overlay compressed filesystem
+
+TOC :
+
+Gentoo users
+Compiling compFUSEd
+Configuration
+Mount example
+
+
+
+
+Gentoo users
+------------
+You need to emerge the following ebuilds :
+
+emerge lzo
+emerge sys-fs/fuse
+
+
+Compile
+-------
+tar -zxf cf-200?????.tgz
+cd CompFUSEd/v0.04/
+make
+
+This should create a cf_main file. Some file in the archive are symlinks to this file.
+
+Configuration
+-------------
+
+You can run several instances of compFUSEd. Each will use a different daemon. The configuration file for each daemon has 
+the same name as the executable but with the .conf extension. Below you'll find an example (the cf_main.conf).
+
+IMPORTANT: - the configuration file must either be in same directory as the binary or, if not found, in the user home!
+
+#
+# Location of the compressed files
+#
+Backend cf_backend
+
+#
+# Which compression algorithm
+#
+#compression none
+compression lzo
+#compression zlib
+#compression bzip2
+
+#
+# Exclude files with the extension (can have more than 1 exclude)
+#
+exclude fli
+exclude mp4
+
+exclude bin
+
+cache_size 10
+cache_ttl 300
+map_size 150
+
+#
+#
+log cf_main.log
+
+
+Multiple mounts
+---------------
+
+You can have several compFUSEd mounts on your system. Although you could just copy the binary and give it a new name,
+I it is a better idea to make a symbolic link. Not that it saves your lot of space, it will make upgrading easier.
+2 examples are included in the archive: cf_portage and cf_kde
+
+
+Mount example
+-------------
+
+This how to put the Linux kernel source code on a compFUSEd mount. The idea is to save some space on the /usr/src directory.
+Assuming that like any user you have like 3 or 4 subdirs you end up with a fat /usr/src directory. On the other hand you do
+not recompile your kernel that often so this is good candidate for compression.
+
+We do it step by step. The necessary files are already in the archive: cf_linux and cf_linux.conf. We will store the compressed 
+files in the /usr/.src_cf hidden directory (see backend line in the configuration file).
+
+1) cd /usr
+2) mv src src_backup
+3) mkdir .src_cf
+4) mkdir src
+5) 'cd back to the directory with the compFUSEd file'
+6) mount the new and empty fs: ./cf_linux /usr/src
+7) cd /usr
+8) cp -r src_backup/* src
+9) ls src
+
+You should have seen all the directories and files in step 9. That's it, this are compressed. If you trust compFUSEd enough
+you can now throw the src_backup directory, put your .config file(s) somewhere safe tough :-P

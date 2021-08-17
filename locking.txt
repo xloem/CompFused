@@ -1,0 +1,8 @@
+cf_map_get_map_lock	-> global lock for all the entries
+cf_map_get_lock		-> per entry lock to seperate reads & writes
+cf_map_get_openlock	-> per entry lock for open() & close() tracking
+
+
+map_lock in: open close
+lock in: read, write , open, close
+openlock in: open, close
